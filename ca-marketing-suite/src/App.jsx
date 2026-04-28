@@ -905,24 +905,42 @@ function ApiKeyBanner({ onSet }) {
 export default function App() {
   const [activeTool, setActiveTool] = useState(TOOLS[0]);
   const [values, setValues] = useState({});
-  const { output, loading, error, generate, stop, setOutput } = useStreamingAPI();
+  const [output, setOutput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const abortRef = useRef(null);
+
+  const stop = () => {
+    if (abortRef.current) abortRef.current.abort();
+    setLoading(false);
+  };
 
   const handleGenerate = async () => {
-    const systemPrompt = buildPrompt(activeTool.id, values);
+    // Cancel any in-progress generation
+    if (abortRef.current) abortRef.current.abort();
+    abortRef.current = new AbortController();
+
     setOutput("");
+    setError(null);
+    setLoading(true);
+
+    const systemPrompt = buildPrompt(activeTool.id, values);
 
     try {
-      // Calls /api/generate.js (Vercel serverless function)
-      // Your Anthropic API key lives in Vercel env vars — never in the browser
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abortRef.current.signal,
         body: JSON.stringify({ systemPrompt }),
       });
 
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error?.message || `API error ${res.status}`);
+        let errMsg = `Server error ${res.status}`;
+        try {
+          const errJson = await res.json();
+          errMsg = errJson.error || errMsg;
+        } catch {}
+        throw new Error(errMsg);
       }
 
       const reader = res.body.getReader();
@@ -942,15 +960,22 @@ export default function App() {
           if (data === "[DONE]") continue;
           try {
             const parsed = JSON.parse(data);
-            const delta = parsed.delta?.text || "";
+            // Handle both Anthropic streaming event formats
+            const delta =
+              parsed.delta?.text ||
+              parsed.delta?.content?.[0]?.text ||
+              (parsed.type === "content_block_delta" ? parsed.delta?.text : "") ||
+              "";
             if (delta) setOutput(prev => prev + delta);
           } catch {}
         }
       }
     } catch (e) {
       if (e.name !== "AbortError") {
-        setOutput(`Error: ${e.message}\n\n${apiKey ? "Check your API key and try again." : "Add your Anthropic API key above."}`);
+        setError(e.message);
       }
+    } finally {
+      setLoading(false);
     }
   };
 
